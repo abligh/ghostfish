@@ -1,0 +1,15 @@
+TODO
+====
+
+* Look at the Id / Generation thing. Monotonic time? Lamport clock?
+
+* Examine serialization of RpcAddress
+* SendAsync to group
+* SendAsync to Leader (with retry retrying it to the new leader)
+
+* Add WaitGroup for Mux shutdown
+
+* Convert FSM Mutex to RWLock()
+
+* Look at view of whether peers are up / down
+* Web server
