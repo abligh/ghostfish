@@ -25,6 +25,7 @@ const (
 	RpcErrBadAddr      = iota // The address is bad
 	RpcErrProhibited   = iota // Prohibited by filter list
 	RpcErrNotLeader    = iota // The RPC command cannot be executed as it was sent to the leader but the recipient was not the leader at the relevant time
+	RpcErrRedirect     = iota // The RPC command is redirected elsewhere
 )
 
 var rpcErrorMap map[int]string = map[int]string{
@@ -36,6 +37,7 @@ var rpcErrorMap map[int]string = map[int]string{
 	RpcErrBadAddr:      "The address is bad",
 	RpcErrProhibited:   "Prohibited by filter list",
 	RpcErrNotLeader:    "Not the leader",
+	RpcErrRedirect:     "Redirected",
 }
 
 // RpcError holds an error type
@@ -85,7 +87,7 @@ type RpcAddress interface {
 // Type RpcTransport is an interface that represents an opaque RPC transport
 type RpcTransport interface {
 	Send(pkt *RpcPacket) error // send an RPC packet asynchronously
-	GetAddress() *RpcAddress   // address of the transport
+	GetAddress() RpcAddress    // address of the transport
 }
 
 // Directions of RPC packet
@@ -159,6 +161,7 @@ type rpcCommunication struct {
 type rpcResponseHandler struct {
 	ReplyChannel chan<- RpcReply // channel through which the reply packet should be set
 	quit         chan bool       // channel to signal timeout goroutine should quit - write 'true' to perform a shutdown
+	redirect     chan RpcAddress // channel to signal that a packet should be resent without decrementing the retry count (e.g. if the leader has changed)
 }
 
 // func String() converts an RpcError to a string
@@ -211,7 +214,7 @@ func (mux *RpcMux) sendWithFilter(pkt *RpcPacket) error {
 
 // func Handle handles an inbound packet
 func (mux *RpcMux) handleRequest(request *RpcPacket) {
-	// ALEX: check whether we are already processing, and if so return cached version; if null ignore
+	// check whether we are already processing, and if so return cached version; if null ignore
 	// drop all replies of other generations
 	// drop all replies older than the last unacked
 	mux.smutex.Lock()
@@ -313,12 +316,13 @@ func (request *RpcPacket) MakeError(source RpcAddress, errNum int) *RpcPacket {
 	return rpcErr
 }
 
-// func checkTimeout transmits a synthesized timeout packet after a given delay
+// func sendWithRetry sends a packet to a given destination
 //
 // this is called client side only
 func (mux *RpcMux) sendWithRetry(req *RpcPacket, rrh *rpcResponseHandler, parameters *RpcParameters) {
 	retriesRemaining := parameters.Retries
 	for {
+		// ALEX: transform leader address here
 		if err := mux.sendWithFilter(req); err != nil {
 			go func() {
 				log.Printf("sendasync returned %v", err)
@@ -348,6 +352,10 @@ func (mux *RpcMux) sendWithRetry(req *RpcPacket, rrh *rpcResponseHandler, parame
 					mux.handleResponse(shutdownPacket)
 				}
 				return
+			case redirectTo := <-rrh.redirect:
+				// we need to resend the packet without decrementing retries
+				req.Dest = redirectTo
+				resend = true
 			}
 		}
 	}
@@ -364,28 +372,6 @@ func (mux *RpcMux) handleResponse(response *RpcPacket) {
 	if response.Generation != mux.generation {
 		return
 	}
-	searchcomm := response.getReplyCommunication()
-	var handler *rpcResponseHandler = nil
-	mux.amutex.Lock()
-	// TODO: optimise this into a single 'Remove' call
-	if item := mux.active.Get(searchcomm); item != nil {
-		if comm := item.(*rpcCommunication); comm != nil &&
-			comm.source == searchcomm.source &&
-			comm.dest == searchcomm.dest &&
-			comm.id == searchcomm.id &&
-			comm.service == searchcomm.service {
-			mux.active.Delete(item)
-			handler = comm.handler
-		}
-	}
-	mux.amutex.Unlock()
-	if handler == nil {
-		return
-	}
-	// between the Unlock() and the next statement, the timer may expire, leading to
-	// a second call to HandleResponse, but it will immediately be dropped as the
-	// active map will now have the handler removed
-	close(handler.quit)
 	if response.Data.GetPktType() != RpcPktReply || response.Dest != mux.address {
 		return
 	}
@@ -394,6 +380,39 @@ func (mux *RpcMux) handleResponse(response *RpcPacket) {
 		log.Println("[WARN] Response was not actually a response type")
 		return
 	}
+	searchcomm := response.getReplyCommunication()
+	var handler *rpcResponseHandler = nil
+	var redirectTo RpcAddress = nil
+	mux.amutex.Lock()
+	// TODO: optimise this into a single 'Remove' call
+	if item := mux.active.Get(searchcomm); item != nil {
+		if comm := item.(*rpcCommunication); comm != nil &&
+			comm.source == searchcomm.source &&
+			/* comm.dest == searchcomm.dest &&    ALEX: Don't check dest (source of reply) as may have changed if e.g. to leader */
+			comm.id == searchcomm.id &&
+			comm.service == searchcomm.service {
+			if reply.ErrorType.ErrorType == RpcErrRedirect {
+				redirectTo, _ = reply.Reply.(RpcAddress)
+			}
+			if redirectTo != nil {
+				mux.active.Delete(item)
+			}
+			handler = comm.handler
+		}
+	}
+	mux.amutex.Unlock()
+	if handler == nil {
+		return
+	}
+	if redirectTo != nil {
+		handler.redirect <- redirectTo
+		return
+	}
+	// between the Unlock() and the next statement, the timer may expire, leading to
+	// a second call to HandleResponse, but it will immediately be dropped as the
+	// active map will now have the handler removed
+	close(handler.quit)
+	close(handler.redirect)
 	handler.ReplyChannel <- reply
 	return
 }
@@ -413,6 +432,7 @@ func (mux *RpcMux) SendAsync(dest *RpcAddress, service string, request *RpcReque
 	responseHandler := rpcResponseHandler{
 		ReplyChannel: replyChan,
 		quit:         make(chan bool),
+		redirect:     make(chan RpcAddress),
 	}
 	comm := req.getRequestCommunication()
 	comm.handler = &responseHandler
@@ -533,7 +553,7 @@ func (e rpcPingEndpoint) Handle(mux *RpcMux, request *RpcPacket) *RpcPacket {
 // The mux initially has no services registered
 func NewRpcMux(transport RpcTransport) *RpcMux {
 	mux := &RpcMux{
-		address:    *transport.GetAddress(),
+		address:    transport.GetAddress(),
 		nextId:     0,
 		generation: randUint64(),
 		transport:  transport,

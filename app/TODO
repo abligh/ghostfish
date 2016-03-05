@@ -7,6 +7,8 @@ TODO
 * SendAsync to group
 * SendAsync to Leader (with retry retrying it to the new leader)
 
+* Hmmm change approach to the above so that it does not use a simple redirect as that can't remember the leader. We need aliases or something.
+
 * Add WaitGroup for Mux shutdown
 
 * Convert FSM Mutex to RWLock()

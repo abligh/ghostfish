@@ -11,7 +11,7 @@ type RpcPacketFilterDebug struct {
 	log         bool
 	prefix      string
 	losePackets int64
-	count		int64
+	count       int64
 	action      RpcPacketFilterAction
 }
 
@@ -27,7 +27,7 @@ func NewRpcPacketFilterDebug(prefix string, action int, log bool) *RpcPacketFilt
 func (f *RpcPacketFilterDebug) Filter(pkt *RpcPacket) RpcPacketFilterAction {
 	// avoids race warning
 	count := atomic.AddInt64(&f.count, 1)
-	if (count <= f.losePackets) {
+	if count <= f.losePackets {
 		return RpcPacketFilterAction{Action: RpcPacketFilterActionDrop}
 	}
 	if f.log {
@@ -126,7 +126,7 @@ func TestRpcPacketPing(t *testing.T) {
 			t.Errorf("[ERROR] Ping return is %s\n", reply.ErrorType.String())
 		}
 	}
-	
+
 	log.Println("[TEST] Ping bar with lossy drop")
 	lossyFilter := NewRpcPacketFilterDebug("[BARRXLOSS]", RpcPacketFilterActionAccept, false)
 	var f *RpcPacketFilterDebug = (*lossyFilter).(*RpcPacketFilterDebug)

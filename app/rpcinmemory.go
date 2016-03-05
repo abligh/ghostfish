@@ -27,8 +27,8 @@ type RpcInMemoryAddress struct {
 	address string
 }
 
-func (t *RpcInMemoryTransport) GetAddress() *RpcAddress {
-	return &t.addr
+func (t *RpcInMemoryTransport) GetAddress() RpcAddress {
+	return t.addr
 }
 
 func (t *RpcInMemoryTransport) Send(pkt *RpcPacket) error {

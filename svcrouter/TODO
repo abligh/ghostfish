@@ -1,0 +1,4 @@
+TODO
+====
+
+Dispatcher Peers can offer more than one service, so should not register in the current manner
